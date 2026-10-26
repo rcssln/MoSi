@@ -21,7 +21,7 @@ def seq(values):
 
 def params(**kw):
     p = {**config.BASE_PARAMS, "rule": "baseline", "time_limit": None,
-         "fleet_size": 1, "mean_interarrival": 1.0, "warmup": 0, "run_length": 100}
+         "fleet_size": 1, "mean_interarrival": 1.0, "trip_mean": 40.0, "warmup": 0, "run_length": 100}
     p.update(kw)
     return p
 
@@ -39,6 +39,9 @@ class TestModel(unittest.TestCase):
         self.assertEqual((r["arrived"], r["boarded"], r["still_waiting"]), (20, 4, 16))
         self.assertAlmostEqual(r["avg_wait"], (0 + 0 + 9.5 + 9.0) / 4)
         self.assertAlmostEqual(r["max_wait"], 9.5)
+        # arrival -> departure: P1 2.5-1, P2 2.5-2, P3 13.5-3, P4 13.5-4
+        self.assertAlmostEqual(r["avg_depart_wait"], (1.5 + 0.5 + 10.5 + 9.5) / 4)
+        self.assertAlmostEqual(r["max_depart_wait"], 10.5)
         self.assertAlmostEqual(r["avg_seats"], 2.0)
         self.assertAlmostEqual(r["avg_idle"], (2.5 + 1.0) / 2)
         self.assertAlmostEqual(r["bay_util"], 3.5 / 20.5)

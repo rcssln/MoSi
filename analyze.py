@@ -9,8 +9,10 @@ from scipy import stats
 import config
 
 MEASURES = {   # column -> label with units
-    "avg_wait": "Average passenger wait (min)",
+    "avg_wait": "Average passenger wait in line (min)",
     "max_wait": "Maximum passenger wait (min)",
+    "avg_depart_wait": "Average time from arrival to departure (min)",
+    "max_depart_wait": "Maximum time from arrival to departure (min)",
     "avg_waiting": "Average passengers waiting (people)",
     "avg_idle": "Jeepney time at terminal per trip (min)",
     "bay_util": "Bay utilization (fraction)",
@@ -115,8 +117,9 @@ if __name__ == "__main__":
     summ.to_csv(os.path.join(OUT, "summary.csv"), index=False)
     diff = compare_to_baseline(df)
     diff.to_csv(os.path.join(OUT, "diff_vs_baseline.csv"), index=False)
-    plot_vs_T(summ, "avg_wait", "wait_vs_T.png")
-    plot_vs_T(summ, "avg_idle", "idle_vs_T.png")
+    if len(config.TIME_LIMITS) > 1:       # a line chart needs more than one T value
+        plot_vs_T(summ, "avg_wait", "wait_vs_T.png")
+        plot_vs_T(summ, "avg_idle", "idle_vs_T.png")
     plot_scenarios(summ, "avg_wait", "scenarios_avg_wait.png")
     plot_scenarios(summ, "served_per_hour", "scenarios_served.png")
     print(summ[["scenario", "avg_wait_mean", "avg_wait_hw", "avg_idle_mean",

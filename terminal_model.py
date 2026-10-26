@@ -36,7 +36,8 @@ class Terminal:
         self.arrived = 0
         self.left_line = 0
         # Statistics after warm-up only
-        self.waits = []          # one value per boarded passenger (min)
+        self.waits = []          # one value per boarded passenger (min): arrival -> leaves line
+        self.depart_waits = []   # arrival -> jeepney departs (min), includes time sitting inside
         self.seats = []          # passengers on board at each departure
         self.idles = []          # time at terminal per trip (min)
         self.area = 0.0          # integral of queue length over time
@@ -72,13 +73,13 @@ class Terminal:
         yield pax.boarded                   # waits until a jeepney takes them
 
     def load(self):
-        """Load passengers into the jeepney in the bay; returns number on board."""
+        """Load passengers into the jeepney in the bay; returns the passengers on board."""
         env, cap = self.env, self.p["capacity"]
         timed = self.p["rule"] == "timed"
         deadline = env.now + self.p["time_limit"] if timed else None
-        seats = 0
-        while seats < cap:
-            if timed and env.now >= deadline and seats >= 1:
+        onboard = []
+        while len(onboard) < cap:
+            if timed and env.now >= deadline and len(onboard) >= 1:
                 break                                   # time limit reached -> go
             self.track()
             get = self.line.get()                       # ask for the next passenger in line
@@ -94,10 +95,10 @@ class Terminal:
             if env.now >= self.warmup:
                 self.waits.append(env.now - pax.arrival_time)
             pax.boarded.succeed()
-            seats += 1
-            self.log(f"passenger boards (seat {seats}/{cap})")
+            onboard.append(pax)
+            self.log(f"passenger boards (seat {len(onboard)}/{cap})")
             yield env.timeout(self.next_board())
-        return seats
+        return onboard
 
     def jeepney(self, jid):
         env = self.env
@@ -109,12 +110,14 @@ class Terminal:
                 bay_enter = env.now
                 self.bay_since = bay_enter
                 self.log(f"jeepney {jid} enters bay")
-                seats = yield from self.load()
+                onboard = yield from self.load()
+                seats = len(onboard)
                 self.bay_busy += max(0.0, env.now - max(bay_enter, self.warmup))
                 self.bay_since = None
                 if env.now >= self.warmup:
                     self.seats.append(seats)
                     self.idles.append(env.now - arrive)
+                    self.depart_waits += [env.now - pax.arrival_time for pax in onboard]
                 self.log(f"jeepney {jid} departs with {seats} passengers")
             yield env.timeout(self.next_trip())         # round trip, then rejoin
 
@@ -128,6 +131,8 @@ class Terminal:
         out = {
             "avg_wait": mean(self.waits),
             "max_wait": max(self.waits) if self.waits else float("nan"),
+            "avg_depart_wait": mean(self.depart_waits),
+            "max_depart_wait": max(self.depart_waits) if self.depart_waits else float("nan"),
             "avg_waiting": self.area / measured,
             "avg_idle": mean(self.idles),
             "bay_util": self.bay_busy / measured,
