@@ -41,6 +41,73 @@ def plot_key_measures(summ):
     plt.close(fig)
 
 
+def plot_slide_table(summ):
+    """Small table image for a slide: four key measures, means only."""
+    rows = [("Jeepney idle time (min per trip)", "avg_idle", "{:.1f}"),
+            ("Time until departure (min)", "avg_depart_wait", "{:.2f}"),
+            ("Seats filled per departure", "avg_seats", "{:.1f}"),
+            ("Passengers served per hour", "served_per_hour", "{:.0f}")]
+    cols = [("peak", "baseline", "Peak\nBaseline"), ("peak", "timed", "Peak\nT = 5 min"),
+            ("offpeak", "baseline", "Off-peak\nBaseline"), ("offpeak", "timed", "Off-peak\nT = 5 min")]
+    cells = []
+    for _, m, fmt in rows:
+        line = []
+        for period, rule, _ in cols:
+            r = summ[(summ.period == period) & (summ.rule == rule)].iloc[0]
+            line.append(fmt.format(r[m + "_mean"]))
+        cells.append(line)
+    fig, ax = plt.subplots(figsize=(9, 3.2))
+    ax.axis("off")
+    table = ax.table(cellText=cells, rowLabels=[r[0] for r in rows],
+                     colLabels=[c[2] for c in cols], loc="center", cellLoc="center")
+    table.auto_set_font_size(False)
+    table.set_fontsize(12)
+    table.scale(1, 2.2)
+    for (r, c), cell in table.get_celld().items():
+        if r == 0:
+            cell.set_facecolor("#1F5C1F")
+            cell.set_text_props(color="white", weight="bold")
+    ax.set_title(f"Simulation results, N = {config.FLEET_SIZES[0]} jeepneys (mean of "
+                 f"{config.REPLICATIONS} replications)", fontsize=12)
+    fig.tight_layout()
+    fig.savefig(os.path.join(OUT, "results_table.png"), dpi=200)
+    plt.close(fig)
+
+
+def plot_diff_table(diff):
+    """Small table image: T = 5 minus baseline with 95% CI, four key measures."""
+    rows = [("Jeepney idle time (min per trip)", "avg_idle", "{:+.1f}"),
+            ("Time until departure (min)", "avg_depart_wait", "{:+.2f}"),
+            ("Seats filled per departure", "avg_seats", "{:+.1f}"),
+            ("Passengers served per hour", "served_per_hour", "{:+.1f}")]
+    cells = []
+    for _, m, fmt in rows:
+        line = []
+        for period in ("peak", "offpeak"):
+            r = diff[diff.scenario.str.startswith(period)].iloc[0]
+            line.append(f"{fmt.format(r[m + '_diff'])} ± {r[m + '_hw']:.2f}")
+        sig = "Yes" if diff[m + "_signif"].all() else ("No" if not diff[m + "_signif"].any() else "Partly")
+        line.append(sig)
+        cells.append(line)
+    fig, ax = plt.subplots(figsize=(9, 3.2))
+    ax.axis("off")
+    table = ax.table(cellText=cells, rowLabels=[r[0] for r in rows],
+                     colLabels=["Peak", "Off-peak", "Significant?"],
+                     loc="center", cellLoc="center")
+    table.auto_set_font_size(False)
+    table.set_fontsize(12)
+    table.scale(1, 2.2)
+    for (r, c), cell in table.get_celld().items():
+        if r == 0:
+            cell.set_facecolor("#1F5C1F")
+            cell.set_text_props(color="white", weight="bold")
+    ax.set_title("T = 5 min minus baseline: mean difference ± 95% confidence interval",
+                 fontsize=12)
+    fig.tight_layout()
+    fig.savefig(os.path.join(OUT, "difference_table.png"), dpi=200)
+    plt.close(fig)
+
+
 def capacity_per_min(n):
     """Rough max passengers/min the fleet can carry: N x C per (round trip + loading)."""
     load = config.CAPACITY * config.BOARD_MEAN_SEC / 60
@@ -127,7 +194,9 @@ if __name__ == "__main__":
     fleet = pd.read_csv(os.path.join(OUT, "sensitivity_fleet.csv"))
 
     plot_key_measures(summ)
-    cap = capacity_per_min(config.FLEET_SIZES[0])
+    plot_slide_table(summ)
+    plot_diff_table(diff)
+    cap =capacity_per_min(config.FLEET_SIZES[0])
     plot_sweep(arr, "arrival_per_min", "Passenger arrival rate (passengers per minute)",
                f"Effect of arrival rate, N = {config.FLEET_SIZES[0]}", "sensitivity_arrival.png",
                cap, f"approx. fleet capacity ({cap:.1f}/min)")

@@ -1,0 +1,186 @@
+﻿  1  # terminal_model.py - SimPy model of one jeepney terminal (one loading bay, one waiting line).
+  2  # Passengers arrive at random and join a single first-come, first-served line. Jeepneys
+  3  # queue for the one loading bay, load passengers until the dispatch rule says to depart,
+  4  # make a random round trip, and rejoin the queue. All times are in minutes. Statistics
+  5  # are recorded only after the warm-up period.
+  6  
+  7  import numpy as np
+  8  import simpy
+  9  
+ 10  # Stores the time a passenger joined the line and an event that is triggered when a
+ 11  # jeepney takes the passenger from the line.
+ 12  class Passenger:
+ 13      def __init__(self, env, arrival_time):
+ 14          self.arrival_time = arrival_time
+ 15          self.boarded = env.event()
+ 16  
+ 17  # Holds the whole system: the passenger line, the loading bay, the random samplers,
+ 18  # and every counter used for the results. A test can replace any sampler with fixed
+ 19  # values. The whole-run counters (arrived, left_line) are used for the conservation check;
+ 20  # the lists and sums below them are recorded after the warm-up only.
+ 21  class Terminal:
+ 22      def __init__(self, env, params, rng, log=False):
+ 23          self.env = env
+ 24          self.p = params
+ 25          self.rng = rng
+ 26          self.line = simpy.Store(env)
+ 27          self.bay = simpy.Resource(env, capacity=1)
+ 28          self.warmup = params["warmup"]
+ 29  
+ 30          self.next_gap = params.get("arrival_sampler") or (
+ 31              lambda: rng.exponential(params["mean_interarrival"]))
+ 32          self.next_board = params.get("board_sampler") or (
+ 33              lambda: max(params["board_min_sec"],
+ 34                          rng.normal(params["board_mean_sec"], params["board_sd_sec"])) / 60)
+ 35          self.next_trip = params.get("trip_sampler") or (
+ 36              lambda: max(params["trip_min"],
+ 37                          rng.normal(params["trip_mean"], params["trip_sd"])))
+ 38  
+ 39          self.arrived = 0
+ 40          self.left_line = 0
+ 41          self.waits = []
+ 42          self.depart_waits = []
+ 43          self.seats = []
+ 44          self.idles = []
+ 45          self.area = 0.0
+ 46          self.last_t = 0.0
+ 47          self.bay_busy = 0.0
+ 48          self.bay_since = None
+ 49          self.log_lines = [] if log else None
+ 50  
+ 51      # Adds one line "time  event" to the event log. Does nothing when logging is off.
+ 52      def log(self, text):
+ 53          if self.log_lines is not None:
+ 54              self.log_lines.append(f"{self.env.now:8.2f}  {text}")
+ 55  
+ 56      # Keeps the running total of (line length x time) used to compute the average number
+ 57      # of passengers waiting. Must be called just before the line length changes. Time
+ 58      # inside the warm-up period is not counted.
+ 59      def track(self):
+ 60          now = self.env.now
+ 61          start = max(self.last_t, self.warmup)
+ 62          if now > start:
+ 63              self.area += len(self.line.items) * (now - start)
+ 64          self.last_t = now
+ 65  
+ 66      # Runs for the whole simulation. After each random inter-arrival time (Exponential),
+ 67      # it creates one new passenger process.
+ 68      def passenger_generator(self):
+ 69          while True:
+ 70              yield self.env.timeout(self.next_gap())
+ 71              self.env.process(self.passenger())
+ 72  
+ 73      # One passenger. Joins the back of the waiting line, then stays until load() takes
+ 74      # them from the front of the line.
+ 75      def passenger(self):
+ 76          pax = Passenger(self.env, self.env.now)
+ 77          self.arrived += 1
+ 78          self.track()
+ 79          self.line.put(pax)
+ 80          self.log(f"passenger arrives (line = {len(self.line.items)})")
+ 81          yield pax.boarded
+ 82  
+ 83      # Loads the jeepney that is in the bay and returns the passengers on board. Each
+ 84      # passenger takes a random boarding time. Departure rules:
+ 85      # baseline - depart only when all seats are full
+ 86      # timed    - depart when full, or when the time limit has passed since the jeepney
+ 87      # entered the bay; a jeepney with nobody on board keeps waiting for its
+ 88      # first passenger instead of leaving empty
+ 89      def load(self):
+ 90          env, cap = self.env, self.p["capacity"]
+ 91          timed = self.p["rule"] == "timed"
+ 92          deadline = env.now + self.p["time_limit"] if timed else None
+ 93          onboard = []
+ 94          while len(onboard) < cap:
+ 95              if timed and env.now >= deadline and len(onboard) >= 1:
+ 96                  break
+ 97              self.track()
+ 98              get = self.line.get()
+ 99              if timed and env.now < deadline:
+100                  yield get | env.timeout(deadline - env.now)
+101                  if not get.triggered:
+102                      get.cancel()
+103                      continue
+104              else:
+105                  yield get
+106              pax = get.value
+107              self.left_line += 1
+108              if env.now >= self.warmup:
+109                  self.waits.append(env.now - pax.arrival_time)
+110              pax.boarded.succeed()
+111              onboard.append(pax)
+112              self.log(f"passenger boards (seat {len(onboard)}/{cap})")
+113              yield env.timeout(self.next_board())
+114          return onboard
+115  
+116      # Life cycle of one jeepney, repeated forever: join the jeepney queue, enter the bay
+117      # when it is free, load, depart, travel for a random round-trip time, then rejoin the
+118      # queue. At each departure after the warm-up it records the seats filled, the time
+119      # spent at the terminal (including waiting for the bay), and each passenger's time
+120      # from arrival to departure.
+121      def jeepney(self, jid):
+122          env = self.env
+123          while True:
+124              arrive = env.now
+125              self.log(f"jeepney {jid} arrives at terminal")
+126              with self.bay.request() as req:
+127                  yield req
+128                  bay_enter = env.now
+129                  self.bay_since = bay_enter
+130                  self.log(f"jeepney {jid} enters bay")
+131                  onboard = yield from self.load()
+132                  seats = len(onboard)
+133                  self.bay_busy += max(0.0, env.now - max(bay_enter, self.warmup))
+134                  self.bay_since = None
+135                  if env.now >= self.warmup:
+136                      self.seats.append(seats)
+137                      self.idles.append(env.now - arrive)
+138                      self.depart_waits += [env.now - pax.arrival_time for pax in onboard]
+139                  self.log(f"jeepney {jid} departs with {seats} passengers")
+140              yield env.timeout(self.next_trip())
+141  
+142      # Converts the recorded values into the performance measures of one replication:
+143      # average and maximum wait in line, average and maximum time from arrival to
+144      # departure, average passengers waiting, jeepney idle time per trip, bay utilization
+145      # (fraction of time occupied), passengers served per hour, and seats filled per
+146      # departure. Measures with no data are returned as nan. The whole-run counts are
+147      # included so the conservation check can be made.
+148      def results(self, end):
+149          self.track()
+150          if self.bay_since is not None:
+151              self.bay_busy += end - max(self.bay_since, self.warmup)
+152          measured = end - self.warmup
+153          mean = lambda x: float(np.mean(x)) if len(x) else float("nan")
+154          out = {
+155              "avg_wait": mean(self.waits),
+156              "max_wait": max(self.waits) if self.waits else float("nan"),
+157              "avg_depart_wait": mean(self.depart_waits),
+158              "max_depart_wait": max(self.depart_waits) if self.depart_waits else float("nan"),
+159              "avg_waiting": self.area / measured,
+160              "avg_idle": mean(self.idles),
+161              "bay_util": self.bay_busy / measured,
+162              "served_per_hour": len(self.waits) / (measured / 60),
+163              "avg_seats": mean(self.seats),
+164              "departures": len(self.seats),
+165              "arrived": self.arrived,
+166              "boarded": self.left_line,
+167              "still_waiting": len(self.line.items),
+168          }
+169          if self.log_lines is not None:
+170              out["log"] = self.log_lines
+171          return out
+172  
+173  # Runs one replication: builds the terminal, starts the passenger arrivals and all
+174  # jeepneys (every jeepney starts in the queue at time 0), runs for the warm-up plus the
+175  # measured period, and returns the performance measures. The same seed always gives the
+176  # same result.
+177  def run_simulation(params, seed, log=False):
+178      env = simpy.Environment()
+179      rng = np.random.default_rng(seed)
+180      term = Terminal(env, params, rng, log)
+181      env.process(term.passenger_generator())
+182      for jid in range(params["fleet_size"]):
+183          env.process(term.jeepney(jid))
+184      end = params["warmup"] + params["run_length"]
+185      env.run(until=end)
+186      return term.results(end)

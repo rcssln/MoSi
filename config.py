@@ -20,11 +20,11 @@ OUTPUT_DIR = "outputs"
 CAPACITY = 20           # reported by project owner: about 20 passengers when full (C)
 
 # Passenger inter-arrival time: Exponential, mean in minutes.
-# ASSUMPTION: survey answers "3-5" (rush) and "2-4" (quiet) were read as passengers
-# per MINUTE, using the midpoints 4 and 3. Confirm the unit with your groupmates.
+# Reported by the group: 3-5 passengers every 1.5 min at rush hour, 1-3 every 1.5 min
+# in quiet times. The midpoint of each range is used (a single value is ASSUMED).
 ARRIVAL_MEAN_MIN = {
-    "peak": 1 / 4,      # ASSUMPTION: 4 passengers per minute
-    "offpeak": 1 / 3,   # ASSUMPTION: 3 passengers per minute
+    "peak": 1.5 / 4,    # reported 3-5 passengers per 1.5 min; midpoint 4 per 1.5 min (2.67/min)
+    "offpeak": 1.5 / 2, # reported 1-3 passengers per 1.5 min; midpoint 2 per 1.5 min (1.33/min)
 }
 
 # Boarding time per passenger: Normal, truncated at a small positive minimum

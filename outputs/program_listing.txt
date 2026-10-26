@@ -1,0 +1,990 @@
+﻿======================================================================
+FILE: config.py
+======================================================================
+  1  """config.py - every parameter and the scenario list live here.
+  2  
+  3  Values marked ASSUMPTION have NOT been measured. Replace them with your own
+  4  data (fit_inputs.py prints suggested replacements) before reporting results.
+  5  Time units: minutes everywhere, except boarding time which is in seconds.
+  6  
+  7  Terminal modeled: Laoag City terminal. Route: Laoag City - Batac City - Paoay,
+  8  driven as a full round trip back to Laoag (one route, treated as one line;
+  9  passengers are not split by destination).
+ 10  """
+ 11  
+ 12  # ---------------- Experiment settings ----------------
+ 13  SEED_BASE = 2025        # replication r uses seed SEED_BASE + r
+ 14  REPLICATIONS = 30       # independent replications per scenario
+ 15  WARMUP_MIN = 120        # ASSUMPTION: statistics are discarded before this time
+ 16  RUN_LENGTH_MIN = 480    # ASSUMPTION: 8 hours of measured time after the warm-up
+ 17  OUTPUT_DIR = "outputs"
+ 18  
+ 19  # ---------------- System parameters ----------------
+ 20  CAPACITY = 20           # reported by project owner: about 20 passengers when full (C)
+ 21  
+ 22  # Passenger inter-arrival time: Exponential, mean in minutes.
+ 23  # ASSUMPTION: survey answers "3-5" (rush) and "2-4" (quiet) were read as passengers
+ 24  # per MINUTE, using the midpoints 4 and 3. Confirm the unit with your groupmates.
+ 25  ARRIVAL_MEAN_MIN = {
+ 26      "peak": 1 / 4,      # ASSUMPTION: 4 passengers per minute
+ 27      "offpeak": 1 / 3,   # ASSUMPTION: 3 passengers per minute
+ 28  }
+ 29  
+ 30  # Boarding time per passenger: Normal, truncated at a small positive minimum
+ 31  BOARD_MEAN_SEC = 6.0    # ASSUMPTION
+ 32  BOARD_SD_SEC = 2.0      # ASSUMPTION
+ 33  BOARD_MIN_SEC = 1.0     # ASSUMPTION: truncation point
+ 34  
+ 35  # Round-trip time: Normal, truncated at a small positive minimum.
+ 36  # Reported: a round trip takes about 40 min normally and about 60 min in heavy traffic.
+ 37  # Traffic is not modeled, so one distribution is used for both periods.
+ 38  # ASSUMPTION: mean 50 min (middle of the reported range), same for peak and off-peak.
+ 39  TRIP_MEAN_MIN = {"peak": 50.0, "offpeak": 50.0}
+ 40  TRIP_SD_MIN = 8.0       # ASSUMPTION: not reported; covers most of the 40-60 min range
+ 41  TRIP_MIN_MIN = 5.0      # ASSUMPTION: truncation point
+ 42  
+ 43  # Initial fleet: all N jeepneys line up at the terminal at time 0
+ 44  FLEET_SIZES = [15]      # reported: 15 jeepneys serve the route
+ 45  
+ 46  # Timed-rule limits to test (minutes since the jeepney entered the bay).
+ 47  # Reported: jeepneys usually leave after about 5 min, so only T = 5 is tested.
+ 48  TIME_LIMITS = [5]
+ 49  
+ 50  # Base parameters handed to the model (scenario values are added on top)
+ 51  BASE_PARAMS = {
+ 52      "capacity": CAPACITY,
+ 53      "warmup": WARMUP_MIN,
+ 54      "run_length": RUN_LENGTH_MIN,
+ 55      "board_mean_sec": BOARD_MEAN_SEC,
+ 56      "board_sd_sec": BOARD_SD_SEC,
+ 57      "board_min_sec": BOARD_MIN_SEC,
+ 58      "trip_sd": TRIP_SD_MIN,
+ 59      "trip_min": TRIP_MIN_MIN,
+ 60  }
+ 61  
+ 62  
+ 63  def build_scenarios():
+ 64      """One dict per scenario: peak/off-peak x fleet size x dispatch rule."""
+ 65      scenarios = []
+ 66      for period, mean_gap in ARRIVAL_MEAN_MIN.items():
+ 67          for n in FLEET_SIZES:
+ 68              common = {"period": period, "fleet_size": n, "mean_interarrival": mean_gap,
+ 69                        "trip_mean": TRIP_MEAN_MIN[period]}
+ 70              scenarios.append({"name": f"{period}_N{n}_baseline", "rule": "baseline",
+ 71                                "time_limit": None, **common})
+ 72              for t in TIME_LIMITS:
+ 73                  scenarios.append({"name": f"{period}_N{n}_timed{t}", "rule": "timed",
+ 74                                    "time_limit": t, **common})
+ 75      return scenarios
+ 76  
+ 77  
+ 78  SCENARIOS = build_scenarios()
+ 79  
+ 80  # ---------------- Validation ----------------
+ 81  # Fill in values you observed at the real terminal (None = not provided).
+ 82  # "scenario" must match one name in SCENARIOS, e.g. "peak_N6_baseline".
+ 83  OBSERVED = {
+ 84      "scenario": "peak_N15_timed5",   # real terminal: jeepneys leave after about 5 min
+ 85      "avg_wait": None,    # minutes
+ 86      "avg_seats": None,   # passengers per departure
+ 87  }
+
+======================================================================
+FILE: terminal_model.py
+======================================================================
+  1  # terminal_model.py - SimPy model of one jeepney terminal (one loading bay, one waiting line).
+  2  # Passengers arrive at random and join a single first-come, first-served line. Jeepneys
+  3  # queue for the one loading bay, load passengers until the dispatch rule says to depart,
+  4  # make a random round trip, and rejoin the queue. All times are in minutes. Statistics
+  5  # are recorded only after the warm-up period.
+  6  
+  7  import numpy as np
+  8  import simpy
+  9  
+ 10  # Stores the time a passenger joined the line and an event that is triggered when a
+ 11  # jeepney takes the passenger from the line.
+ 12  class Passenger:
+ 13      def __init__(self, env, arrival_time):
+ 14          self.arrival_time = arrival_time
+ 15          self.boarded = env.event()
+ 16  
+ 17  # Holds the whole system: the passenger line, the loading bay, the random samplers,
+ 18  # and every counter used for the results. A test can replace any sampler with fixed
+ 19  # values. The whole-run counters (arrived, left_line) are used for the conservation check;
+ 20  # the lists and sums below them are recorded after the warm-up only.
+ 21  class Terminal:
+ 22      def __init__(self, env, params, rng, log=False):
+ 23          self.env = env
+ 24          self.p = params
+ 25          self.rng = rng
+ 26          self.line = simpy.Store(env)
+ 27          self.bay = simpy.Resource(env, capacity=1)
+ 28          self.warmup = params["warmup"]
+ 29  
+ 30          self.next_gap = params.get("arrival_sampler") or (
+ 31              lambda: rng.exponential(params["mean_interarrival"]))
+ 32          self.next_board = params.get("board_sampler") or (
+ 33              lambda: max(params["board_min_sec"],
+ 34                          rng.normal(params["board_mean_sec"], params["board_sd_sec"])) / 60)
+ 35          self.next_trip = params.get("trip_sampler") or (
+ 36              lambda: max(params["trip_min"],
+ 37                          rng.normal(params["trip_mean"], params["trip_sd"])))
+ 38  
+ 39          self.arrived = 0
+ 40          self.left_line = 0
+ 41          self.waits = []
+ 42          self.depart_waits = []
+ 43          self.seats = []
+ 44          self.idles = []
+ 45          self.area = 0.0
+ 46          self.last_t = 0.0
+ 47          self.bay_busy = 0.0
+ 48          self.bay_since = None
+ 49          self.log_lines = [] if log else None
+ 50  
+ 51      # Adds one line "time  event" to the event log. Does nothing when logging is off.
+ 52      def log(self, text):
+ 53          if self.log_lines is not None:
+ 54              self.log_lines.append(f"{self.env.now:8.2f}  {text}")
+ 55  
+ 56      # Keeps the running total of (line length x time) used to compute the average number
+ 57      # of passengers waiting. Must be called just before the line length changes. Time
+ 58      # inside the warm-up period is not counted.
+ 59      def track(self):
+ 60          now = self.env.now
+ 61          start = max(self.last_t, self.warmup)
+ 62          if now > start:
+ 63              self.area += len(self.line.items) * (now - start)
+ 64          self.last_t = now
+ 65  
+ 66      # Runs for the whole simulation. After each random inter-arrival time (Exponential),
+ 67      # it creates one new passenger process.
+ 68      def passenger_generator(self):
+ 69          while True:
+ 70              yield self.env.timeout(self.next_gap())
+ 71              self.env.process(self.passenger())
+ 72  
+ 73      # One passenger. Joins the back of the waiting line, then stays until load() takes
+ 74      # them from the front of the line.
+ 75      def passenger(self):
+ 76          pax = Passenger(self.env, self.env.now)
+ 77          self.arrived += 1
+ 78          self.track()
+ 79          self.line.put(pax)
+ 80          self.log(f"passenger arrives (line = {len(self.line.items)})")
+ 81          yield pax.boarded
+ 82  
+ 83      # Loads the jeepney that is in the bay and returns the passengers on board. Each
+ 84      # passenger takes a random boarding time. Departure rules:
+ 85      # baseline - depart only when all seats are full
+ 86      # timed    - depart when full, or when the time limit has passed since the jeepney
+ 87      # entered the bay; a jeepney with nobody on board keeps waiting for its
+ 88      # first passenger instead of leaving empty
+ 89      def load(self):
+ 90          env, cap = self.env, self.p["capacity"]
+ 91          timed = self.p["rule"] == "timed"
+ 92          deadline = env.now + self.p["time_limit"] if timed else None
+ 93          onboard = []
+ 94          while len(onboard) < cap:
+ 95              if timed and env.now >= deadline and len(onboard) >= 1:
+ 96                  break
+ 97              self.track()
+ 98              get = self.line.get()
+ 99              if timed and env.now < deadline:
+100                  yield get | env.timeout(deadline - env.now)
+101                  if not get.triggered:
+102                      get.cancel()
+103                      continue
+104              else:
+105                  yield get
+106              pax = get.value
+107              self.left_line += 1
+108              if env.now >= self.warmup:
+109                  self.waits.append(env.now - pax.arrival_time)
+110              pax.boarded.succeed()
+111              onboard.append(pax)
+112              self.log(f"passenger boards (seat {len(onboard)}/{cap})")
+113              yield env.timeout(self.next_board())
+114          return onboard
+115  
+116      # Life cycle of one jeepney, repeated forever: join the jeepney queue, enter the bay
+117      # when it is free, load, depart, travel for a random round-trip time, then rejoin the
+118      # queue. At each departure after the warm-up it records the seats filled, the time
+119      # spent at the terminal (including waiting for the bay), and each passenger's time
+120      # from arrival to departure.
+121      def jeepney(self, jid):
+122          env = self.env
+123          while True:
+124              arrive = env.now
+125              self.log(f"jeepney {jid} arrives at terminal")
+126              with self.bay.request() as req:
+127                  yield req
+128                  bay_enter = env.now
+129                  self.bay_since = bay_enter
+130                  self.log(f"jeepney {jid} enters bay")
+131                  onboard = yield from self.load()
+132                  seats = len(onboard)
+133                  self.bay_busy += max(0.0, env.now - max(bay_enter, self.warmup))
+134                  self.bay_since = None
+135                  if env.now >= self.warmup:
+136                      self.seats.append(seats)
+137                      self.idles.append(env.now - arrive)
+138                      self.depart_waits += [env.now - pax.arrival_time for pax in onboard]
+139                  self.log(f"jeepney {jid} departs with {seats} passengers")
+140              yield env.timeout(self.next_trip())
+141  
+142      # Converts the recorded values into the performance measures of one replication:
+143      # average and maximum wait in line, average and maximum time from arrival to
+144      # departure, average passengers waiting, jeepney idle time per trip, bay utilization
+145      # (fraction of time occupied), passengers served per hour, and seats filled per
+146      # departure. Measures with no data are returned as nan. The whole-run counts are
+147      # included so the conservation check can be made.
+148      def results(self, end):
+149          self.track()
+150          if self.bay_since is not None:
+151              self.bay_busy += end - max(self.bay_since, self.warmup)
+152          measured = end - self.warmup
+153          mean = lambda x: float(np.mean(x)) if len(x) else float("nan")
+154          out = {
+155              "avg_wait": mean(self.waits),
+156              "max_wait": max(self.waits) if self.waits else float("nan"),
+157              "avg_depart_wait": mean(self.depart_waits),
+158              "max_depart_wait": max(self.depart_waits) if self.depart_waits else float("nan"),
+159              "avg_waiting": self.area / measured,
+160              "avg_idle": mean(self.idles),
+161              "bay_util": self.bay_busy / measured,
+162              "served_per_hour": len(self.waits) / (measured / 60),
+163              "avg_seats": mean(self.seats),
+164              "departures": len(self.seats),
+165              "arrived": self.arrived,
+166              "boarded": self.left_line,
+167              "still_waiting": len(self.line.items),
+168          }
+169          if self.log_lines is not None:
+170              out["log"] = self.log_lines
+171          return out
+172  
+173  # Runs one replication: builds the terminal, starts the passenger arrivals and all
+174  # jeepneys (every jeepney starts in the queue at time 0), runs for the warm-up plus the
+175  # measured period, and returns the performance measures. The same seed always gives the
+176  # same result.
+177  def run_simulation(params, seed, log=False):
+178      env = simpy.Environment()
+179      rng = np.random.default_rng(seed)
+180      term = Terminal(env, params, rng, log)
+181      env.process(term.passenger_generator())
+182      for jid in range(params["fleet_size"]):
+183          env.process(term.jeepney(jid))
+184      end = params["warmup"] + params["run_length"]
+185      env.run(until=end)
+186      return term.results(end)
+
+======================================================================
+FILE: run_experiments.py
+======================================================================
+  1  """run_experiments.py - run every scenario for several independent replications."""
+  2  import os
+  3  import pandas as pd
+  4  import config
+  5  from terminal_model import run_simulation
+  6  
+  7  
+  8  def run_all(replications=config.REPLICATIONS):
+  9      rows = []
+ 10      for sc in config.SCENARIOS:
+ 11          params = {**config.BASE_PARAMS, **sc}
+ 12          for rep in range(replications):
+ 13              # Same seed for the same replication number in every scenario, so
+ 14              # scenarios see similar random numbers (helps the paired comparison).
+ 15              seed = config.SEED_BASE + rep
+ 16              res = run_simulation(params, seed)
+ 17              rows.append({"scenario": sc["name"], "period": sc["period"],
+ 18                           "fleet_size": sc["fleet_size"], "rule": sc["rule"],
+ 19                           "time_limit": sc["time_limit"], "replication": rep,
+ 20                           "seed": seed, **res})
+ 21          print(f"done {sc['name']}")
+ 22      return pd.DataFrame(rows)
+ 23  
+ 24  
+ 25  if __name__ == "__main__":
+ 26      os.makedirs(config.OUTPUT_DIR, exist_ok=True)
+ 27      df = run_all()
+ 28      path = os.path.join(config.OUTPUT_DIR, "results.csv")
+ 29      df.to_csv(path, index=False)
+ 30      print(f"saved {len(df)} rows to {path}")
+
+======================================================================
+FILE: analyze.py
+======================================================================
+  1  """analyze.py - confidence intervals, comparison with baseline, charts, validation."""
+  2  import os
+  3  import numpy as np
+  4  import pandas as pd
+  5  import matplotlib
+  6  matplotlib.use("Agg")
+  7  import matplotlib.pyplot as plt
+  8  from scipy import stats
+  9  import config
+ 10  
+ 11  MEASURES = {   # column -> label with units
+ 12      "avg_wait": "Average passenger wait in line (min)",
+ 13      "max_wait": "Maximum passenger wait (min)",
+ 14      "avg_depart_wait": "Average time from arrival to departure (min)",
+ 15      "max_depart_wait": "Maximum time from arrival to departure (min)",
+ 16      "avg_waiting": "Average passengers waiting (people)",
+ 17      "avg_idle": "Jeepney time at terminal per trip (min)",
+ 18      "bay_util": "Bay utilization (fraction)",
+ 19      "served_per_hour": "Passengers served (per hour)",
+ 20      "avg_seats": "Seats filled per departure (people)",
+ 21  }
+ 22  OUT = config.OUTPUT_DIR
+ 23  
+ 24  
+ 25  def ci(x, level=0.95):
+ 26      """Mean and half-width of the t confidence interval."""
+ 27      x = np.asarray(x, dtype=float)
+ 28      x = x[~np.isnan(x)]
+ 29      n = len(x)
+ 30      half = stats.t.ppf((1 + level) / 2, n - 1) * x.std(ddof=1) / np.sqrt(n)
+ 31      return x.mean(), half
+ 32  
+ 33  
+ 34  def summarize(df):
+ 35      rows = []
+ 36      for name, g in df.groupby("scenario", sort=False):
+ 37          row = {"scenario": name, **{k: g[k].iloc[0] for k in
+ 38                 ("period", "fleet_size", "rule", "time_limit")}}
+ 39          for m in MEASURES:
+ 40              row[m + "_mean"], row[m + "_hw"] = ci(g[m])
+ 41          rows.append(row)
+ 42      return pd.DataFrame(rows)
+ 43  
+ 44  
+ 45  def compare_to_baseline(df):
+ 46      """Paired difference (timed - baseline) per replication, with 95% CI."""
+ 47      rows = []
+ 48      for _, sc in df.drop_duplicates("scenario").iterrows():
+ 49          if sc["rule"] == "baseline":
+ 50              continue
+ 51          base_name = f"{sc['period']}_N{sc['fleet_size']}_baseline"
+ 52          a = df[df.scenario == sc["scenario"]].set_index("replication")
+ 53          b = df[df.scenario == base_name].set_index("replication")
+ 54          row = {"scenario": sc["scenario"], "baseline": base_name}
+ 55          for m in MEASURES:
+ 56              mean, half = ci(a[m] - b[m])
+ 57              row[m + "_diff"], row[m + "_hw"] = mean, half
+ 58              row[m + "_signif"] = abs(mean) > half      # CI excludes 0
+ 59          rows.append(row)
+ 60      return pd.DataFrame(rows)
+ 61  
+ 62  
+ 63  def plot_vs_T(summ, measure, fname):
+ 64      """Measure vs time limit T, one line per (period, N); dashed = baseline."""
+ 65      fig, ax = plt.subplots(figsize=(7, 4.5))
+ 66      for (period, n), g in summ.groupby(["period", "fleet_size"]):
+ 67          t = g[g.rule == "timed"].sort_values("time_limit")
+ 68          line = ax.errorbar(t.time_limit, t[measure + "_mean"], yerr=t[measure + "_hw"],
+ 69                             marker="o", capsize=3, label=f"{period}, N={n}")
+ 70          base = g[g.rule == "baseline"][measure + "_mean"].iloc[0]
+ 71          ax.axhline(base, ls="--", lw=1, color=line[0].get_color())
+ 72      ax.set_xlabel("Time limit T (min)")
+ 73      ax.set_ylabel(MEASURES[measure])
+ 74      ax.set_title(f"{MEASURES[measure]} vs. time limit T\n(dashed = baseline, bars = 95% CI)")
+ 75      ax.set_xticks(config.TIME_LIMITS)
+ 76      ax.legend()
+ 77      fig.tight_layout()
+ 78      fig.savefig(os.path.join(OUT, fname), dpi=150)
+ 79      plt.close(fig)
+ 80  
+ 81  
+ 82  def plot_scenarios(summ, measure, fname):
+ 83      """Bar chart comparing all scenarios on one measure."""
+ 84      fig, ax = plt.subplots(figsize=(8, 6))
+ 85      ax.barh(summ.scenario, summ[measure + "_mean"], xerr=summ[measure + "_hw"], capsize=3)
+ 86      ax.set_xlabel(MEASURES[measure])
+ 87      ax.set_ylabel("Scenario")
+ 88      ax.set_title(f"{MEASURES[measure]} by scenario (95% CI)")
+ 89      ax.invert_yaxis()
+ 90      fig.tight_layout()
+ 91      fig.savefig(os.path.join(OUT, fname), dpi=150)
+ 92      plt.close(fig)
+ 93  
+ 94  
+ 95  def validate(scenario, observed_avg_wait, observed_avg_seats, results_csv=None):
+ 96      """Is each observed value inside the simulated 95% CI? Returns a dict of results."""
+ 97      df = pd.read_csv(results_csv or os.path.join(OUT, "results.csv"))
+ 98      g = df[df.scenario == scenario]
+ 99      out = {}
+100      for label, col, obs in (("avg wait (min)", "avg_wait", observed_avg_wait),
+101                              ("seats per departure", "avg_seats", observed_avg_seats)):
+102          if obs is None:
+103              continue
+104          mean, half = ci(g[col])
+105          inside = mean - half <= obs <= mean + half
+106          print(f"{scenario} {label}: observed {obs:.2f}, simulated "
+107                f"{mean:.2f} [{mean - half:.2f}, {mean + half:.2f}] -> "
+108                f"{'INSIDE' if inside else 'OUTSIDE'} the 95% CI")
+109          out[col] = inside
+110      return out
+111  
+112  
+113  if __name__ == "__main__":
+114      os.makedirs(OUT, exist_ok=True)
+115      df = pd.read_csv(os.path.join(OUT, "results.csv"))
+116      summ = summarize(df)
+117      summ.to_csv(os.path.join(OUT, "summary.csv"), index=False)
+118      diff = compare_to_baseline(df)
+119      diff.to_csv(os.path.join(OUT, "diff_vs_baseline.csv"), index=False)
+120      if len(config.TIME_LIMITS) > 1:       # a line chart needs more than one T value
+121          plot_vs_T(summ, "avg_wait", "wait_vs_T.png")
+122          plot_vs_T(summ, "avg_idle", "idle_vs_T.png")
+123      plot_scenarios(summ, "avg_wait", "scenarios_avg_wait.png")
+124      plot_scenarios(summ, "served_per_hour", "scenarios_served.png")
+125      print(summ[["scenario", "avg_wait_mean", "avg_wait_hw", "avg_idle_mean",
+126                  "bay_util_mean", "avg_seats_mean"]].round(2).to_string(index=False))
+127      obs = config.OBSERVED
+128      if obs["avg_wait"] is not None or obs["avg_seats"] is not None:
+129          validate(obs["scenario"], obs["avg_wait"], obs["avg_seats"])
+130      else:
+131          print("\nValidation skipped: fill config.OBSERVED with your observed values.")
+
+======================================================================
+FILE: sensitivity.py
+======================================================================
+  1  """sensitivity.py - where does each dispatch rule stop working well?
+  2  
+  3  Sweep 1: passenger arrival rate (passengers per minute), fleet size fixed.
+  4  Sweep 2: fleet size N, arrival rate fixed at the peak value.
+  5  Both compare the baseline rule with the timed rule (T = first value in config.TIME_LIMITS).
+  6  Uses the PEAK round-trip time from config. Results go to outputs/sensitivity_*.csv.
+  7  """
+  8  import os
+  9  import pandas as pd
+ 10  import config
+ 11  from terminal_model import run_simulation
+ 12  
+ 13  RATES_PER_MIN = [0.5, 1, 1.5, 2, 2.5, 3, 4, 5, 6, 8]    # passengers per minute
+ 14  FLEET_SWEEP = [6, 8, 10, 12, 15, 18, 20]
+ 15  REPS = config.REPLICATIONS
+ 16  T = config.TIME_LIMITS[0]
+ 17  
+ 18  
+ 19  def one_setting(rule, fleet_size, mean_gap, reps=REPS):
+ 20      rows = []
+ 21      for rep in range(reps):
+ 22          p = {**config.BASE_PARAMS, "rule": rule, "time_limit": T if rule == "timed" else None,
+ 23               "fleet_size": fleet_size, "mean_interarrival": mean_gap,
+ 24               "trip_mean": config.TRIP_MEAN_MIN["peak"]}
+ 25          rows.append(run_simulation(p, config.SEED_BASE + rep))
+ 26      return pd.DataFrame(rows).mean(numeric_only=True)
+ 27  
+ 28  
+ 29  def sweep(values, make_args, label):
+ 30      out = []
+ 31      for v in values:
+ 32          for rule in ("baseline", "timed"):
+ 33              res = one_setting(rule, *make_args(v))
+ 34              out.append({label: v, "rule": rule, **res.to_dict()})
+ 35          print(f"done {label} = {v}")
+ 36      return pd.DataFrame(out)
+ 37  
+ 38  
+ 39  if __name__ == "__main__":
+ 40      os.makedirs(config.OUTPUT_DIR, exist_ok=True)
+ 41      n = config.FLEET_SIZES[0]
+ 42      peak_gap = config.ARRIVAL_MEAN_MIN["peak"]
+ 43      a = sweep(RATES_PER_MIN, lambda r: (n, 1 / r), "arrival_per_min")
+ 44      a.to_csv(os.path.join(config.OUTPUT_DIR, "sensitivity_arrival.csv"), index=False)
+ 45      f = sweep(FLEET_SWEEP, lambda k: (k, peak_gap), "fleet_size")
+ 46      f.to_csv(os.path.join(config.OUTPUT_DIR, "sensitivity_fleet.csv"), index=False)
+ 47      print("saved sensitivity_arrival.csv and sensitivity_fleet.csv")
+
+======================================================================
+FILE: report.py
+======================================================================
+  1  """report.py - presentation outputs: charts (PNG) and one Excel workbook.
+  2  
+  3  Run after run_experiments.py, analyze.py and sensitivity.py.
+  4  Needs openpyxl (only for the Excel file).
+  5  """
+  6  import os
+  7  import pandas as pd
+  8  import matplotlib
+  9  matplotlib.use("Agg")
+ 10  import matplotlib.pyplot as plt
+ 11  import config
+ 12  from analyze import MEASURES, summarize
+ 13  
+ 14  OUT = config.OUTPUT_DIR
+ 15  COLORS = {"baseline": "#4C72B0", "timed": "#DD8452"}
+ 16  LABELS = {"baseline": "Baseline (leave when full)",
+ 17            "timed": f"Timed (leave when full or after T = {config.TIME_LIMITS[0]} min)"}
+ 18  PANELS = ["avg_wait", "avg_depart_wait", "max_depart_wait", "avg_idle", "avg_seats",
+ 19            "served_per_hour"]
+ 20  
+ 21  
+ 22  def plot_key_measures(summ):
+ 23      """Grouped bars: baseline vs timed, peak vs off-peak, 95% CI as error bars."""
+ 24      fig, axes = plt.subplots(2, 3, figsize=(14, 8))
+ 25      for ax, m in zip(axes.flat, PANELS):
+ 26          for i, rule in enumerate(("baseline", "timed")):
+ 27              g = summ[summ.rule == rule].sort_values("period", ascending=False)  # peak first
+ 28              x = [j + (i - 0.5) * 0.35 for j in range(len(g))]
+ 29              ax.bar(x, g[m + "_mean"], 0.35, yerr=g[m + "_hw"], capsize=4,
+ 30                     color=COLORS[rule], label=LABELS[rule])
+ 31          ax.set_xticks(range(2))
+ 32          ax.set_xticklabels(["Peak", "Off-peak"])
+ 33          ax.set_ylabel(MEASURES[m])
+ 34          ax.set_title(MEASURES[m])
+ 35      handles, labels = axes[0, 0].get_legend_handles_labels()
+ 36      fig.legend(handles, labels, loc="lower center", ncol=2, fontsize=10)
+ 37      fig.suptitle(f"Baseline vs timed dispatch, N = {config.FLEET_SIZES[0]} jeepneys "
+ 38                   "(bars = mean, whiskers = 95% CI)")
+ 39      fig.tight_layout(rect=(0, 0.05, 1, 1))
+ 40      fig.savefig(os.path.join(OUT, "key_measures.png"), dpi=150)
+ 41      plt.close(fig)
+ 42  
+ 43  
+ 44  def plot_slide_table(summ):
+ 45      """Small table image for a slide: four key measures, means only."""
+ 46      rows = [("Jeepney idle time (min per trip)", "avg_idle", "{:.1f}"),
+ 47              ("Time until departure (min)", "avg_depart_wait", "{:.2f}"),
+ 48              ("Seats filled per departure", "avg_seats", "{:.1f}"),
+ 49              ("Passengers served per hour", "served_per_hour", "{:.0f}")]
+ 50      cols = [("peak", "baseline", "Peak\nBaseline"), ("peak", "timed", "Peak\nT = 5 min"),
+ 51              ("offpeak", "baseline", "Off-peak\nBaseline"), ("offpeak", "timed", "Off-peak\nT = 5 min")]
+ 52      cells = []
+ 53      for _, m, fmt in rows:
+ 54          line = []
+ 55          for period, rule, _ in cols:
+ 56              r = summ[(summ.period == period) & (summ.rule == rule)].iloc[0]
+ 57              line.append(fmt.format(r[m + "_mean"]))
+ 58          cells.append(line)
+ 59      fig, ax = plt.subplots(figsize=(9, 3.2))
+ 60      ax.axis("off")
+ 61      table = ax.table(cellText=cells, rowLabels=[r[0] for r in rows],
+ 62                       colLabels=[c[2] for c in cols], loc="center", cellLoc="center")
+ 63      table.auto_set_font_size(False)
+ 64      table.set_fontsize(12)
+ 65      table.scale(1, 2.2)
+ 66      for (r, c), cell in table.get_celld().items():
+ 67          if r == 0:
+ 68              cell.set_facecolor("#1F5C1F")
+ 69              cell.set_text_props(color="white", weight="bold")
+ 70      ax.set_title(f"Simulation results, N = {config.FLEET_SIZES[0]} jeepneys (mean of "
+ 71                   f"{config.REPLICATIONS} replications)", fontsize=12)
+ 72      fig.tight_layout()
+ 73      fig.savefig(os.path.join(OUT, "results_table.png"), dpi=200)
+ 74      plt.close(fig)
+ 75  
+ 76  
+ 77  def plot_diff_table(diff):
+ 78      """Small table image: T = 5 minus baseline with 95% CI, four key measures."""
+ 79      rows = [("Jeepney idle time (min per trip)", "avg_idle", "{:+.1f}"),
+ 80              ("Time until departure (min)", "avg_depart_wait", "{:+.2f}"),
+ 81              ("Seats filled per departure", "avg_seats", "{:+.1f}"),
+ 82              ("Passengers served per hour", "served_per_hour", "{:+.1f}")]
+ 83      cells = []
+ 84      for _, m, fmt in rows:
+ 85          line = []
+ 86          for period in ("peak", "offpeak"):
+ 87              r = diff[diff.scenario.str.startswith(period)].iloc[0]
+ 88              line.append(f"{fmt.format(r[m + '_diff'])} ± {r[m + '_hw']:.2f}")
+ 89          sig = "Yes" if diff[m + "_signif"].all() else ("No" if not diff[m + "_signif"].any() else "Partly")
+ 90          line.append(sig)
+ 91          cells.append(line)
+ 92      fig, ax = plt.subplots(figsize=(9, 3.2))
+ 93      ax.axis("off")
+ 94      table = ax.table(cellText=cells, rowLabels=[r[0] for r in rows],
+ 95                       colLabels=["Peak", "Off-peak", "Significant?"],
+ 96                       loc="center", cellLoc="center")
+ 97      table.auto_set_font_size(False)
+ 98      table.set_fontsize(12)
+ 99      table.scale(1, 2.2)
+100      for (r, c), cell in table.get_celld().items():
+101          if r == 0:
+102              cell.set_facecolor("#1F5C1F")
+103              cell.set_text_props(color="white", weight="bold")
+104      ax.set_title("T = 5 min minus baseline: mean difference ± 95% confidence interval",
+105                   fontsize=12)
+106      fig.tight_layout()
+107      fig.savefig(os.path.join(OUT, "difference_table.png"), dpi=200)
+108      plt.close(fig)
+109  
+110  
+111  def capacity_per_min(n):
+112      """Rough max passengers/min the fleet can carry: N x C per (round trip + loading)."""
+113      load = config.CAPACITY * config.BOARD_MEAN_SEC / 60
+114      return n * config.CAPACITY / (config.TRIP_MEAN_MIN["peak"] + load)
+115  
+116  
+117  def plot_sweep(df, xcol, xlabel, title, fname, vline=None, vlabel=None):
+118      panels = [("avg_wait", "Average wait in line (min)"),
+119                ("avg_depart_wait", "Average time from arrival to departure (min)"),
+120                ("avg_idle", "Jeepney time at terminal per trip (min)"),
+121                ("avg_seats", "Seats filled per departure (people)"),
+122                ("served_per_hour", "Passengers served (per hour)")]
+123      fig, axes = plt.subplots(2, 3, figsize=(15, 8))
+124      axes.flat[-1].axis("off")
+125      for ax, (m, lab) in zip(axes.flat, panels):
+126          for rule in ("baseline", "timed"):
+127              g = df[df.rule == rule]
+128              ax.plot(g[xcol], g[m], marker="o", color=COLORS[rule], label=LABELS[rule])
+129          if vline:
+130              ax.axvline(vline, ls="--", color="gray", lw=1, label=vlabel)
+131          ax.set_xlabel(xlabel)
+132          ax.set_ylabel(lab)
+133          ax.set_title(lab)
+134      axes[0, 0].legend(fontsize=8)
+135      fig.suptitle(title)
+136      fig.tight_layout()
+137      fig.savefig(os.path.join(OUT, fname), dpi=150)
+138      plt.close(fig)
+139  
+140  
+141  def assumptions_table():
+142      c = config
+143      rows = [
+144          ("Terminal / route", "Laoag City terminal; Laoag-Batac-Paoay round trip", "Reported"),
+145          ("Fleet size N", c.FLEET_SIZES[0], "Reported (15 jeepneys)"),
+146          ("Seat capacity C", c.CAPACITY, "Reported (about 20 when full)"),
+147          ("Timed rule T (min)", c.TIME_LIMITS[0], "Reported (leave after about 5 min)"),
+148          ("Peak arrivals (passengers/min)", 1 / c.ARRIVAL_MEAN_MIN["peak"], "ASSUMPTION (survey unit unclear)"),
+149          ("Off-peak arrivals (passengers/min)", 1 / c.ARRIVAL_MEAN_MIN["offpeak"], "ASSUMPTION (survey unit unclear)"),
+150          ("Round trip, peak (min, mean)", c.TRIP_MEAN_MIN["peak"], "Reported 60 min heavy traffic; peak = heavy is ASSUMPTION"),
+151          ("Round trip, off-peak (min, mean)", c.TRIP_MEAN_MIN["offpeak"], "Reported 40 min normal traffic"),
+152          ("Round trip SD (min)", c.TRIP_SD_MIN, "ASSUMPTION"),
+153          ("Boarding time mean / SD (sec)", f"{c.BOARD_MEAN_SEC} / {c.BOARD_SD_SEC}", "ASSUMPTION"),
+154          ("Boarding minimum (sec)", c.BOARD_MIN_SEC, "ASSUMPTION"),
+155          ("Warm-up (min)", c.WARMUP_MIN, "ASSUMPTION"),
+156          ("Measured run length (min)", c.RUN_LENGTH_MIN, "ASSUMPTION"),
+157          ("Replications per scenario", c.REPLICATIONS, "Design choice"),
+158      ]
+159      return pd.DataFrame(rows, columns=["Parameter", "Value", "Source"])
+160  
+161  
+162  def pm(mean, hw, digits=2):
+163      return f"{mean:.{digits}f} +/- {hw:.{digits}f}"
+164  
+165  
+166  def summary_for_slides(summ):
+167      out = pd.DataFrame({"Scenario": summ.scenario, "Period": summ.period, "Rule": summ.rule})
+168      for m, lab in MEASURES.items():
+169          out[lab] = [pm(a, b) for a, b in zip(summ[m + "_mean"], summ[m + "_hw"])]
+170      return out
+171  
+172  
+173  def format_sheets(path):
+174      from openpyxl import load_workbook
+175      from openpyxl.styles import Font, PatternFill, Alignment
+176      wb = load_workbook(path)
+177      for ws in wb.worksheets:
+178          for cell in ws[1]:
+179              cell.font = Font(bold=True, color="FFFFFF")
+180              cell.fill = PatternFill("solid", fgColor="1F5C1F")
+181              cell.alignment = Alignment(wrap_text=True, vertical="center")
+182          for col in ws.columns:
+183              width = max(len(str(c.value)) if c.value is not None else 0 for c in col[:60])
+184              ws.column_dimensions[col[0].column_letter].width = min(max(12, width + 2), 45)
+185          ws.freeze_panes = "B2"
+186      wb.save(path)
+187  
+188  
+189  if __name__ == "__main__":
+190      df = pd.read_csv(os.path.join(OUT, "results.csv"))
+191      summ = summarize(df)
+192      diff = pd.read_csv(os.path.join(OUT, "diff_vs_baseline.csv"))
+193      arr = pd.read_csv(os.path.join(OUT, "sensitivity_arrival.csv"))
+194      fleet = pd.read_csv(os.path.join(OUT, "sensitivity_fleet.csv"))
+195  
+196      plot_key_measures(summ)
+197      plot_slide_table(summ)
+198      plot_diff_table(diff)
+199      cap =capacity_per_min(config.FLEET_SIZES[0])
+200      plot_sweep(arr, "arrival_per_min", "Passenger arrival rate (passengers per minute)",
+201                 f"Effect of arrival rate, N = {config.FLEET_SIZES[0]}", "sensitivity_arrival.png",
+202                 cap, f"approx. fleet capacity ({cap:.1f}/min)")
+203      plot_sweep(fleet, "fleet_size", "Fleet size N (jeepneys)",
+204                 "Effect of fleet size at the peak arrival rate", "sensitivity_fleet.png")
+205  
+206      path = os.path.join(OUT, "results_report.xlsx")
+207      with pd.ExcelWriter(path) as xw:
+208          assumptions_table().to_excel(xw, sheet_name="Assumptions", index=False)
+209          summary_for_slides(summ).to_excel(xw, sheet_name="Summary (mean, 95% CI)", index=False)
+210          summ.to_excel(xw, sheet_name="Summary (numeric)", index=False)
+211          diff.to_excel(xw, sheet_name="Timed minus baseline", index=False)
+212          arr.round(3).to_excel(xw, sheet_name="Sweep arrival rate", index=False)
+213          fleet.round(3).to_excel(xw, sheet_name="Sweep fleet size", index=False)
+214          df.round(4).to_excel(xw, sheet_name="Raw replications", index=False)
+215      format_sheets(path)
+216      print(f"saved {path} and charts in {OUT}")
+
+======================================================================
+FILE: fit_inputs.py
+======================================================================
+  1  """fit_inputs.py - fit Exponential / Normal / Erlang to your collected data.
+  2  
+  3  Usage:  python fit_inputs.py my_data.csv
+  4  
+  5  CSV columns: event_type, and a number in a column named timestamp OR duration.
+  6    event_type        number                                   unit
+  7    passenger_arrival timestamp of each arrival (inter-arrivals are computed)  min
+  8    jeepney_arrival   timestamp of each arrival (inter-arrivals are computed)  min
+  9    boarding          duration per passenger                    sec
+ 10    round_trip        duration                                  min
+ 11  """
+ 12  import json
+ 13  import os
+ 14  import sys
+ 15  import numpy as np
+ 16  import pandas as pd
+ 17  import matplotlib
+ 18  matplotlib.use("Agg")
+ 19  import matplotlib.pyplot as plt
+ 20  from scipy import stats
+ 21  import config
+ 22  
+ 23  # event_type -> (is_timestamp, unit, label)
+ 24  EVENTS = {
+ 25      "passenger_arrival": (True, "min", "Passenger inter-arrival time"),
+ 26      "jeepney_arrival": (True, "min", "Jeepney inter-arrival time"),
+ 27      "boarding": (False, "sec", "Boarding time per passenger"),
+ 28      "round_trip": (False, "min", "Round-trip time"),
+ 29  }
+ 30  
+ 31  
+ 32  def load_samples(path):
+ 33      if not os.path.exists(path):
+ 34          sys.exit(f"File not found: {path}\n"
+ 35                   "'my_data.csv' was only an example name. Pass the path to your own data file; "
+ 36                   "see data_template.csv for the expected columns.")
+ 37      df = pd.read_csv(path)
+ 38      cols = [c for c in ("timestamp", "duration", "value") if c in df.columns]
+ 39      df["x"] = df[cols].bfill(axis=1).iloc[:, 0]
+ 40      samples = {}
+ 41      for event, (is_ts, _, _) in EVENTS.items():
+ 42          x = df.loc[df.event_type == event, "x"].dropna().to_numpy(float)
+ 43          if is_ts:
+ 44              x = np.diff(np.sort(x))          # timestamps -> gaps between events
+ 45          if len(x) >= 5:
+ 46              samples[event] = x
+ 47      return samples
+ 48  
+ 49  
+ 50  def fit_candidates(x):
+ 51      """Return {name: frozen scipy distribution}."""
+ 52      mean = x.mean()
+ 53      cands = {}      # order = plot order
+ 54      mu, sd = stats.norm.fit(x)
+ 55      cands["normal"] = stats.norm(mu, sd)
+ 56      if x.min() > 0:                          # Exponential/Erlang need positive data
+ 57          cands["exponential"] = stats.expon(loc=0, scale=mean)
+ 58          shape, _, _ = stats.gamma.fit(x, floc=0)
+ 59          k = max(1, int(round(shape)))        # Erlang = gamma with integer shape
+ 60          cands["erlang"] = stats.erlang(a=k, scale=mean / k)
+ 61      else:
+ 62          print("   (non-positive values found: skipping Exponential and Erlang)")
+ 63      return cands
+ 64  
+ 65  
+ 66  def describe(name, dist):
+ 67      if name == "exponential":
+ 68          return {"mean": float(dist.kwds["scale"])}
+ 69      if name == "normal":
+ 70          return {"mean": float(dist.mean()), "sd": float(dist.std())}
+ 71      k = dist.args[0] if dist.args else dist.kwds["a"]
+ 72      return {"k": int(k), "scale": float(dist.kwds["scale"])}
+ 73  
+ 74  
+ 75  def fit_and_plot(event, x, outdir):
+ 76      _, unit, label = EVENTS[event]
+ 77      cands = fit_candidates(x)
+ 78      report = {"n": len(x), "sample_mean": float(x.mean()), "sample_sd": float(x.std(ddof=1)),
+ 79                "fits": {}}
+ 80      fig, axes = plt.subplots(1, 1 + len(cands), figsize=(4.5 * (1 + len(cands)), 4))
+ 81      axes[0].hist(x, bins="auto", density=True, alpha=0.5, label="data")
+ 82      grid = np.linspace(x.min(), x.max(), 200)
+ 83      p = (np.arange(1, len(x) + 1) - 0.5) / len(x)
+ 84      for ax, (name, dist) in zip(axes[1:], cands.items()):
+ 85          ks = stats.kstest(x, dist.cdf)       # note: p-value is optimistic for fitted params
+ 86          report["fits"][name] = {**describe(name, dist), "ks_stat": float(ks.statistic),
+ 87                                  "ks_p": float(ks.pvalue)}
+ 88          axes[0].plot(grid, dist.pdf(grid), label=name)
+ 89          ax.scatter(dist.ppf(p), np.sort(x), s=8)
+ 90          lim = [min(x.min(), dist.ppf(p).min()), max(x.max(), dist.ppf(p).max())]
+ 91          ax.plot(lim, lim, "r--")
+ 92          ax.set_title(f"Q-Q plot: {name} (KS p={ks.pvalue:.3f})")
+ 93          ax.set_xlabel(f"Theoretical quantiles ({unit})")
+ 94          ax.set_ylabel(f"Sample quantiles ({unit})")
+ 95      axes[0].set_title(f"{label}: histogram + fits")
+ 96      axes[0].set_xlabel(f"Time ({unit})")
+ 97      axes[0].set_ylabel("Density")
+ 98      axes[0].legend()
+ 99      fig.tight_layout()
+100      fig.savefig(os.path.join(outdir, f"fit_{event}.png"), dpi=150)
+101      plt.close(fig)
+102      report["best_by_ks"] = min(report["fits"], key=lambda k: report["fits"][k]["ks_stat"])
+103      return report
+104  
+105  
+106  if __name__ == "__main__":
+107      if len(sys.argv) < 2:
+108          sys.exit("usage: python fit_inputs.py my_data.csv")
+109      os.makedirs(config.OUTPUT_DIR, exist_ok=True)
+110      result = {}
+111      for event, x in load_samples(sys.argv[1]).items():
+112          result[event] = fit_and_plot(event, x, config.OUTPUT_DIR)
+113          print(f"{event}: n={len(x)}, best fit by KS = {result[event]['best_by_ks']}")
+114          for name, f in result[event]["fits"].items():
+115              print(f"   {name:12s} {f}")
+116      path = os.path.join(config.OUTPUT_DIR, "fitted_params.json")
+117      with open(path, "w") as fh:
+118          json.dump(result, fh, indent=2)
+119      print(f"saved fitted parameters to {path}; copy the chosen values into config.py")
+
+======================================================================
+FILE: tests\test_model.py
+======================================================================
+  1  """Verification tests. Run from the project folder:  python -m unittest discover tests"""
+  2  import math
+  3  import os
+  4  import sys
+  5  import unittest
+  6  
+  7  sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+  8  import config
+  9  from terminal_model import run_simulation
+ 10  
+ 11  
+ 12  def seq(values):
+ 13      """Sampler that returns the listed values in order, then repeats the last one."""
+ 14      it = iter(values)
+ 15      last = [values[-1]]
+ 16      def f():
+ 17          last[0] = next(it, last[0])
+ 18          return last[0]
+ 19      return f
+ 20  
+ 21  
+ 22  def params(**kw):
+ 23      p = {**config.BASE_PARAMS, "rule": "baseline", "time_limit": None,
+ 24           "fleet_size": 1, "mean_interarrival": 1.0, "trip_mean": 40.0, "warmup": 0, "run_length": 100}
+ 25      p.update(kw)
+ 26      return p
+ 27  
+ 28  
+ 29  class TestModel(unittest.TestCase):
+ 30      def test_hand_case_baseline(self):
+ 31          # C=2, N=1. A passenger every 1 min (first at t=1), boarding 0.5 min, trip 10 min.
+ 32          # By hand: bay entered t=0; P1 at 1, P2 at 2 -> full, depart 2.5 (idle 2.5).
+ 33          # Back at 12.5: P3 (arrived 3) waits 9.5, P4 (arrived 4) waits 9.0 -> depart 13.5 (idle 1.0).
+ 34          # 20 arrivals by t=20.5, 4 boarded, 16 waiting. Bay busy 2.5 + 1.0 = 3.5.
+ 35          p = params(capacity=2, run_length=20.5, arrival_sampler=lambda: 1.0,
+ 36                     board_sampler=lambda: 0.5, trip_sampler=lambda: 10.0)
+ 37          r = run_simulation(p, seed=1)
+ 38          self.assertEqual(r["departures"], 2)
+ 39          self.assertEqual((r["arrived"], r["boarded"], r["still_waiting"]), (20, 4, 16))
+ 40          self.assertAlmostEqual(r["avg_wait"], (0 + 0 + 9.5 + 9.0) / 4)
+ 41          self.assertAlmostEqual(r["max_wait"], 9.5)
+ 42          # arrival -> departure: P1 2.5-1, P2 2.5-2, P3 13.5-3, P4 13.5-4
+ 43          self.assertAlmostEqual(r["avg_depart_wait"], (1.5 + 0.5 + 10.5 + 9.5) / 4)
+ 44          self.assertAlmostEqual(r["max_depart_wait"], 10.5)
+ 45          self.assertAlmostEqual(r["avg_seats"], 2.0)
+ 46          self.assertAlmostEqual(r["avg_idle"], (2.5 + 1.0) / 2)
+ 47          self.assertAlmostEqual(r["bay_util"], 3.5 / 20.5)
+ 48  
+ 49      def test_hand_case_timed(self):
+ 50          # C=4, T=3, arrivals at 1.5, 2.5, 3.5... instant boarding.
+ 51          # Two on board at t=3 -> departs at exactly t=3 with 2 passengers.
+ 52          p = params(capacity=4, rule="timed", time_limit=3, run_length=4,
+ 53                     arrival_sampler=seq([1.5, 1.0]), board_sampler=lambda: 0.0,
+ 54                     trip_sampler=lambda: 50.0)
+ 55          r = run_simulation(p, seed=1, log=True)
+ 56          self.assertEqual(r["departures"], 1)
+ 57          self.assertEqual(r["avg_seats"], 2)
+ 58          self.assertAlmostEqual(r["avg_idle"], 3.0)
+ 59          self.assertTrue(any("3.00" in l and "departs with 2" in l for l in r["log"]))
+ 60  
+ 61      def test_timed_waits_for_first_passenger(self):
+ 62          # T=3 elapses with nobody on board; first passenger arrives at t=5 -> depart at 5 with 1.
+ 63          p = params(capacity=4, rule="timed", time_limit=3, run_length=6,
+ 64                     arrival_sampler=seq([5.0, 100.0]), board_sampler=lambda: 0.0,
+ 65                     trip_sampler=lambda: 50.0)
+ 66          r = run_simulation(p, seed=1)
+ 67          self.assertEqual(r["departures"], 1)
+ 68          self.assertEqual(r["avg_seats"], 1)
+ 69          self.assertAlmostEqual(r["avg_idle"], 5.0)
+ 70  
+ 71      def test_conservation_random_runs(self):
+ 72          for rule, t in (("baseline", None), ("timed", 5)):
+ 73              for seed in range(5):
+ 74                  p = params(rule=rule, time_limit=t, fleet_size=3, mean_interarrival=0.5,
+ 75                             warmup=30, run_length=200)
+ 76                  r = run_simulation(p, seed)
+ 77                  self.assertEqual(r["arrived"], r["boarded"] + r["still_waiting"])
+ 78  
+ 79      def test_no_arrivals(self):
+ 80          p = params(arrival_sampler=lambda: 1e9)
+ 81          r = run_simulation(p, seed=1)
+ 82          self.assertEqual((r["arrived"], r["boarded"], r["departures"]), (0, 0, 0))
+ 83          self.assertEqual(r["served_per_hour"], 0)
+ 84          self.assertEqual(r["avg_waiting"], 0)
+ 85          self.assertTrue(math.isnan(r["avg_wait"]))
+ 86  
+ 87      def test_very_high_arrivals(self):
+ 88          # Huge demand and many jeepneys: every jeepney leaves full and the bay is nearly always busy.
+ 89          p = params(capacity=4, fleet_size=30, mean_interarrival=0.001, trip_sampler=lambda: 5.0,
+ 90                     warmup=10, run_length=100)
+ 91          r = run_simulation(p, seed=1)
+ 92          self.assertEqual(r["avg_seats"], 4)
+ 93          self.assertGreater(r["bay_util"], 0.95)
+ 94          self.assertGreater(r["avg_waiting"], 100)
+ 95          self.assertEqual(r["arrived"], r["boarded"] + r["still_waiting"])
+ 96  
+ 97      def test_capacity_one(self):
+ 98          # Edge case C=1: a passenger every 1 min, trip 5 min. The jeepney leaves at
+ 99          # t=1 (P1), is back at 6 (takes P2), back at 11 (takes P3): 3 departures, 1 seat each.
+100          p = params(capacity=1, run_length=12.5, arrival_sampler=lambda: 1.0,
+101                     board_sampler=lambda: 0.0, trip_sampler=lambda: 5.0)
+102          r = run_simulation(p, seed=1)
+103          self.assertEqual(r["departures"], 3)
+104          self.assertEqual(r["avg_seats"], 1)
+105  
+106      def test_first_come_first_served(self):
+107          # C=2, N=1, arrivals at 0.5, 1.5, 2.5 ... Trip 10.2 min, instant boarding.
+108          # Departs at 1.5 with P1, P2 (waits 0, 0). Back at 11.7: takes the OLDEST waiting,
+109          # P3 (arrived 2.5, wait 9.2) and P4 (arrived 3.5, wait 8.2). A LIFO line would differ.
+110          p = params(capacity=2, run_length=12.5, arrival_sampler=seq([0.5, 1.0]),
+111                     board_sampler=lambda: 0.0, trip_sampler=lambda: 10.2)
+112          r = run_simulation(p, seed=1)
+113          self.assertEqual(r["departures"], 2)
+114          self.assertAlmostEqual(r["avg_wait"], (0 + 0 + 9.2 + 8.2) / 4)
+115          self.assertAlmostEqual(r["max_wait"], 9.2)
+116  
+117      def test_warmup_excluded(self):
+118          # Same as the first hand case, but warm-up = 5: the departure at 2.5 is not counted.
+119          # Counted: departure at 13.5 (1 trip, 2 seats, idle 1.0) and P3, P4 (waits 9.5, 9.0).
+120          p = params(capacity=2, warmup=5, run_length=15.5, arrival_sampler=lambda: 1.0,
+121                     board_sampler=lambda: 0.5, trip_sampler=lambda: 10.0)
+122          r = run_simulation(p, seed=1)
+123          self.assertEqual(r["departures"], 1)
+124          self.assertAlmostEqual(r["avg_idle"], 1.0)
+125          self.assertAlmostEqual(r["avg_wait"], 9.25)
+126          self.assertAlmostEqual(r["served_per_hour"], 2 / (15.5 / 60))
+127  
+128      def test_timed_limit_never_reached(self):
+129          # T = 100 min is never reached, so the timed rule must behave exactly like baseline.
+130          kw = dict(capacity=2, run_length=20.5, arrival_sampler=lambda: 1.0,
+131                    board_sampler=lambda: 0.5, trip_sampler=lambda: 10.0)
+132          base = run_simulation(params(**kw), seed=1)
+133          timed = run_simulation(params(rule="timed", time_limit=100, **kw), seed=1)
+134          self.assertEqual(base, timed)
+135  
+136      def test_reproducible(self):
+137          p = {**config.BASE_PARAMS, **config.SCENARIOS[1]}
+138          self.assertEqual(run_simulation(p, 7), run_simulation(p, 7))
+139  
+140  
+141  if __name__ == "__main__":
+142      unittest.main()
+

@@ -94,6 +94,45 @@ class TestModel(unittest.TestCase):
         self.assertGreater(r["avg_waiting"], 100)
         self.assertEqual(r["arrived"], r["boarded"] + r["still_waiting"])
 
+    def test_capacity_one(self):
+        # Edge case C=1: a passenger every 1 min, trip 5 min. The jeepney leaves at
+        # t=1 (P1), is back at 6 (takes P2), back at 11 (takes P3): 3 departures, 1 seat each.
+        p = params(capacity=1, run_length=12.5, arrival_sampler=lambda: 1.0,
+                   board_sampler=lambda: 0.0, trip_sampler=lambda: 5.0)
+        r = run_simulation(p, seed=1)
+        self.assertEqual(r["departures"], 3)
+        self.assertEqual(r["avg_seats"], 1)
+
+    def test_first_come_first_served(self):
+        # C=2, N=1, arrivals at 0.5, 1.5, 2.5 ... Trip 10.2 min, instant boarding.
+        # Departs at 1.5 with P1, P2 (waits 0, 0). Back at 11.7: takes the OLDEST waiting,
+        # P3 (arrived 2.5, wait 9.2) and P4 (arrived 3.5, wait 8.2). A LIFO line would differ.
+        p = params(capacity=2, run_length=12.5, arrival_sampler=seq([0.5, 1.0]),
+                   board_sampler=lambda: 0.0, trip_sampler=lambda: 10.2)
+        r = run_simulation(p, seed=1)
+        self.assertEqual(r["departures"], 2)
+        self.assertAlmostEqual(r["avg_wait"], (0 + 0 + 9.2 + 8.2) / 4)
+        self.assertAlmostEqual(r["max_wait"], 9.2)
+
+    def test_warmup_excluded(self):
+        # Same as the first hand case, but warm-up = 5: the departure at 2.5 is not counted.
+        # Counted: departure at 13.5 (1 trip, 2 seats, idle 1.0) and P3, P4 (waits 9.5, 9.0).
+        p = params(capacity=2, warmup=5, run_length=15.5, arrival_sampler=lambda: 1.0,
+                   board_sampler=lambda: 0.5, trip_sampler=lambda: 10.0)
+        r = run_simulation(p, seed=1)
+        self.assertEqual(r["departures"], 1)
+        self.assertAlmostEqual(r["avg_idle"], 1.0)
+        self.assertAlmostEqual(r["avg_wait"], 9.25)
+        self.assertAlmostEqual(r["served_per_hour"], 2 / (15.5 / 60))
+
+    def test_timed_limit_never_reached(self):
+        # T = 100 min is never reached, so the timed rule must behave exactly like baseline.
+        kw = dict(capacity=2, run_length=20.5, arrival_sampler=lambda: 1.0,
+                  board_sampler=lambda: 0.5, trip_sampler=lambda: 10.0)
+        base = run_simulation(params(**kw), seed=1)
+        timed = run_simulation(params(rule="timed", time_limit=100, **kw), seed=1)
+        self.assertEqual(base, timed)
+
     def test_reproducible(self):
         p = {**config.BASE_PARAMS, **config.SCENARIOS[1]}
         self.assertEqual(run_simulation(p, 7), run_simulation(p, 7))
